@@ -5,7 +5,7 @@ import { z } from "zod";
 import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { changes } from "./events.js";
-import { settings, dataDir, seed, run, one } from "./db.js";
+import { settings, dataDir, seed, run, one, isPostgres } from "./db.js";
 import {
   booking,
   bookingInput,
@@ -42,7 +42,7 @@ if (process.env.DEMO_MODE === "1") {
     throw new Error(
       "Demo mode requires --preview, a separate DATA_DIR, and no live payment/SMS service.",
     );
-  seed();
+  await seed();
 }
 const app = express();
 app.disable("x-powered-by");
@@ -71,10 +71,10 @@ app.use(
       dev || preview ? false : { policy: "same-origin-allow-popups" },
   }),
 );
-app.get("/healthz", (_req, res) => {
+app.get("/healthz", async (_req, res) => {
   res.set("Cache-Control", "no-store");
   try {
-    one("SELECT id FROM salon_settings WHERE id=1");
+    await one("SELECT id FROM salon_settings WHERE id=1");
     res.json({ status: "ok" });
   } catch {
     res.status(503).json({ status: "unavailable" });
@@ -87,7 +87,7 @@ app.use("/api", (req, res, next) => {
 app.post(
   "/api/razorpay/webhook",
   express.raw({ type: "application/json", limit: "100kb" }),
-  (req, res) => {
+  async (req, res) => {
     if (
       !Buffer.isBuffer(req.body) ||
       !signed(
@@ -105,8 +105,8 @@ app.post(
     }
     const entity = data.payload?.payment?.entity;
     if (entity && ["payment.captured", "payment.failed"].includes(data.event)) {
-      const id = recordPayment(entity);
-      if (id && entity.status === "captured") void notify(id);
+      const id = await recordPayment(entity);
+      if (id && entity.status === "captured") notify(id);
     }
     res.json({ ok: true });
   },
@@ -131,31 +131,31 @@ const limit = (max) =>
     message: { error: "Too many requests. Please try again shortly." },
   });
 app.use("/api/admin", admin);
-app.get("/api/catalog", (req, res) =>
+app.get("/api/catalog", async (req, res) =>
   res.json({
-    ...catalog(),
-    settings: settings(),
+    ...(await catalog()),
+    settings: await settings(),
     onlineEnabled,
     today: today(),
   }),
 );
-app.post("/api/quote", limit(90), (req, res) =>
-  res.json(quote(quoteInput.parse(req.body))),
+app.post("/api/quote", limit(90), async (req, res) =>
+  res.json(await quote(quoteInput.parse(req.body))),
 );
-app.get("/api/slots", limit(120), (req, res) => {
+app.get("/api/slots", limit(120), async (req, res) => {
   const q = z
     .object({ date, duration: z.coerce.number().int().min(1).max(1440) })
     .parse(req.query);
-  res.json({ slots: slots(q.date, q.duration) });
+  res.json({ slots: await slots(q.date, q.duration) });
 });
 app.post("/api/bookings", limit(15), async (req, res) => {
   const input = bookingInput.parse(req.body);
-  const { id, existing } = createBooking(input, onlineEnabled);
-  const b = booking(id);
+  const { id, existing } = await createBooking(input, onlineEnabled);
+  const b = await booking(id);
   let payment = null,
     paymentError = "";
   if (!existing) changes.emit("booking");
-  if (b.method === "cash" && !existing) void notify(id);
+  if (b.method === "cash" && !existing) notify(id);
   if (b.method === "online" && b.status === "awaiting_payment")
     try {
       payment = await order(id);
@@ -164,7 +164,7 @@ app.post("/api/bookings", limit(15), async (req, res) => {
     }
   res
     .status(existing ? 200 : 201)
-    .json({ booking: booking(id), payment, paymentError });
+    .json({ booking: await booking(id), payment, paymentError });
 });
 const lookup = z.object({
   id: z
@@ -174,17 +174,17 @@ const lookup = z.object({
     .regex(/^MN-[A-F0-9]{12}$/),
   mobile,
 });
-function lookupBooking(input) {
-  const b = booking(input.id);
+async function lookupBooking(input) {
+  const b = await booking(input.id);
   if (!b || b.mobile !== input.mobile)
     fail(404, "No booking found for that ID and mobile number.");
   return b;
 }
-app.post("/api/lookup", limit(15), (req, res) =>
-  res.json(lookupBooking(lookup.parse(req.body))),
+app.post("/api/lookup", limit(15), async (req, res) =>
+  res.json(await lookupBooking(lookup.parse(req.body))),
 );
 app.post("/api/payments/retry", limit(12), async (req, res) => {
-  const b = lookupBooking(lookup.parse(req.body));
+  const b = await lookupBooking(lookup.parse(req.body));
   const p = await order(b.id);
   if (!p)
     fail(
@@ -201,32 +201,47 @@ app.post("/api/payments/verify", limit(20), async (req, res) => {
       signature: z.string().length(64),
     })
     .parse(req.body);
-  const b = await verify(lookupBooking(input), input);
-  if (b.status === "confirmed") void notify(b.id);
+  const b = await verify(await lookupBooking(input), input);
+  if (b.status === "confirmed") notify(b.id);
   res.json(b);
 });
-app.post("/api/payments/dismiss", limit(20), (req, res) => {
-  const b = lookupBooking(lookup.parse(req.body));
-  run(
+app.post("/api/payments/dismiss", limit(20), async (req, res) => {
+  const b = await lookupBooking(lookup.parse(req.body));
+  await run(
     "UPDATE payments SET state='cancelled',updated=? WHERE booking_id=? AND state='pending' AND EXISTS (SELECT 1 FROM bookings WHERE id=? AND status='awaiting_payment')",
     Date.now(),
     b.id,
     b.id,
   );
-  res.json(booking(b.id));
+  res.json(await booking(b.id));
 });
 app.use("/api", (req, res) =>
   res.status(404).json({ error: "Endpoint not found." }),
 );
-app.use(
-  "/uploads",
-  express.static(resolve(dataDir, "uploads"), {
-    index: false,
-    immutable: true,
-    maxAge: "1y",
-    dotfiles: "deny",
-  }),
-);
+app.get("/uploads/:name", async (req, res, next) => {
+  const match = /^([a-f0-9]{36})\.(jpg|png|webp)$/.exec(req.params.name);
+  if (!match) return res.sendStatus(404);
+  const image = await one(
+    "SELECT content FROM uploaded_images WHERE name=?",
+    req.params.name,
+  );
+  if (!image) return next();
+  res
+    .set("Cache-Control", "public, max-age=31536000, immutable")
+    .type(match[2])
+    .send(Buffer.from(image.content));
+});
+// Existing local SQLite installs may still have images uploaded before database storage was introduced.
+if (!isPostgres)
+  app.use(
+    "/uploads",
+    express.static(resolve(dataDir, "uploads"), {
+      index: false,
+      immutable: true,
+      maxAge: "1y",
+      dotfiles: "deny",
+    }),
+  );
 app.use("/uploads", (req, res) => res.sendStatus(404));
 if (dev) {
   const { createServer } = await import("vite");
@@ -283,9 +298,9 @@ if (dev) {
   );
   app.get(
     ["/", "/booking", "/booking/:id", "/admin", "/admin/*rest"],
-    (req, res) => {
+    async (req, res) => {
       const staff = req.path.startsWith("/admin"),
-        s = settings();
+        s = await settings();
       if (staff || preview || req.path.startsWith("/booking"))
         res.set("X-Robots-Tag", "noindex, nofollow");
       res
@@ -309,25 +324,21 @@ if (dev) {
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
   if (error instanceof z.ZodError)
-    return res
-      .status(400)
-      .json({
-        error: error.issues
-          .map((i) => `${i.path.join(".") || "Input"}: ${i.message}`)
-          .join("; "),
-      });
+    return res.status(400).json({
+      error: error.issues
+        .map((i) => `${i.path.join(".") || "Input"}: ${i.message}`)
+        .join("; "),
+    });
   const status = error.status || 500;
   if (status >= 500) console.error(error);
-  res
-    .status(status)
-    .json({
-      error:
-        status === 500
-          ? "Something went wrong. Please try again."
-          : error.type === "entity.parse.failed"
-            ? "Invalid JSON."
-            : error.message,
-    });
+  res.status(status).json({
+    error:
+      status === 500
+        ? "Something went wrong. Please try again."
+        : error.type === "entity.parse.failed"
+          ? "Invalid JSON."
+          : error.message,
+  });
 });
 const server = app.listen(Number(process.env.PORT || 5173), "0.0.0.0", () =>
   console.log(`Maison Noir is listening on ${server.address().port}.`),

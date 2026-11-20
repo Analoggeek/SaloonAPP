@@ -70,18 +70,18 @@ export const bookingInput = quoteInput.extend({
 });
 const occupancy =
   "(b.status IN ('pending','confirmed','completed') OR (b.status='awaiting_payment' AND b.hold_until>?))";
-export function catalog(admin = false) {
-  const services = all(
+export async function catalog(admin = false) {
+  const services = await all(
     `SELECT s.*, c.name category FROM services s JOIN categories c ON c.id=s.category_id ${admin ? "" : "WHERE s.enabled=1"} ORDER BY s.sort,s.id`,
   );
-  const pkg = all(
+  const pkg = await all(
     `SELECT p.*, COALESCE(SUM(s.duration),0) duration FROM packages p LEFT JOIN package_services ps ON ps.package_id=p.id LEFT JOIN services s ON s.id=ps.service_id ${admin ? "" : "WHERE p.enabled=1"} GROUP BY p.id ORDER BY p.sort,p.id`,
   );
-  const links = all(
+  const links = await all(
     "SELECT ps.*, s.name, s.enabled FROM package_services ps JOIN services s ON s.id=ps.service_id",
   );
   return {
-    categories: all("SELECT * FROM categories ORDER BY id"),
+    categories: await all("SELECT * FROM categories ORDER BY id"),
     services,
     packages: pkg
       .map((p) => ({
@@ -94,8 +94,8 @@ export function catalog(admin = false) {
       ),
   };
 }
-export function quote(input) {
-  const cat = catalog();
+export async function quote(input) {
+  const cat = await catalog();
   const lines = input.items.map((i) => {
     const record = cat[i.kind === "service" ? "services" : "packages"].find(
       (v) => v.id === i.id,
@@ -113,7 +113,7 @@ export function quote(input) {
   let discount = 0,
     coupon = null;
   if (input.coupon) {
-    coupon = one(
+    coupon = await one(
       "SELECT * FROM coupons WHERE code=? AND enabled=1",
       input.coupon,
     );
@@ -121,10 +121,12 @@ export function quote(input) {
       fail(400, "This coupon is invalid or expired.");
     if (subtotal < coupon.minimum)
       fail(400, "The booking does not meet the coupon minimum.");
-    const used = one(
-      `SELECT COUNT(*) n FROM bookings b WHERE coupon_id=? AND ${occupancy}`,
-      coupon.id,
-      Date.now(),
+    const used = (
+      await one(
+        `SELECT COUNT(*) n FROM bookings b WHERE coupon_id=? AND ${occupancy}`,
+        coupon.id,
+        Date.now(),
+      )
     ).n;
     if (coupon.usage_limit !== null && used >= coupon.usage_limit)
       fail(400, "This coupon has reached its usage limit.");
@@ -146,8 +148,8 @@ export function quote(input) {
     couponCode: coupon?.code ?? "",
   };
 }
-export function slots(day, duration, ignore = "") {
-  const a = availability(),
+export async function slots(day, duration, ignore = "") {
+  const a = await availability(),
     now = Date.now(),
     current = today();
   const latest = new Date(`${current}T00:00:00Z`);
@@ -159,11 +161,13 @@ export function slots(day, duration, ignore = "") {
     a.blockedDates.includes(day)
   )
     return [];
-  const occupied = all(
-    `SELECT b.time,b.duration FROM bookings b WHERE b.date=? AND b.id<>? AND ${occupancy}`,
-    day,
-    ignore,
-    now,
+  const occupied = (
+    await all(
+      `SELECT b.time,b.duration FROM bookings b WHERE b.date=? AND b.id<>? AND ${occupancy}`,
+      day,
+      ignore,
+      now,
+    )
   ).map((b) => [minutes(b.time), minutes(b.time) + b.duration]);
   const blocks = a.blockedSlots
     .filter((b) => b.date === day)
@@ -192,23 +196,34 @@ export function slots(day, duration, ignore = "") {
   }
   return output;
 }
-export function customerHasOverlap(phone, day, start, duration, ignore = "") {
+export async function customerHasOverlap(
+  phone,
+  day,
+  start,
+  duration,
+  ignore = "",
+) {
   const begin = minutes(start),
     end = begin + duration;
-  return all(
-    `SELECT b.time,b.duration FROM bookings b JOIN customers c ON c.id=b.customer_id WHERE c.mobile=? AND b.date=? AND b.id<>? AND ${occupancy}`,
-    phone,
-    day,
-    ignore,
-    Date.now(),
+  return (
+    await all(
+      `SELECT b.time,b.duration FROM bookings b JOIN customers c ON c.id=b.customer_id WHERE c.mobile=? AND b.date=? AND b.id<>? AND ${occupancy}`,
+      phone,
+      day,
+      ignore,
+      Date.now(),
+    )
   ).some((b) => minutes(b.time) < end && minutes(b.time) + b.duration > begin);
 }
 export const bookingColumns = `b.*,c.name,c.mobile,c.email,p.state payment_status,p.order_id,p.payment_id`;
 export const bookingJoin = `FROM bookings b JOIN customers c ON c.id=b.customer_id JOIN payments p ON p.booking_id=b.id`;
-export function booking(id, admin = false) {
-  const b = one(`SELECT ${bookingColumns} ${bookingJoin} WHERE b.id=?`, id);
+export async function booking(id, admin = false) {
+  const b = await one(
+    `SELECT ${bookingColumns} ${bookingJoin} WHERE b.id=?`,
+    id,
+  );
   if (!b) return null;
-  b.items = all(
+  b.items = await all(
     "SELECT name,quantity,price,duration FROM booking_items WHERE booking_id=? ORDER BY id",
     id,
   );
@@ -225,9 +240,9 @@ export function booking(id, admin = false) {
   }
   return b;
 }
-export function createBooking(input, onlineEnabled) {
-  return tx(() => {
-    const existing = one(
+export async function createBooking(input, onlineEnabled) {
+  return await tx(async () => {
+    const existing = await one(
       "SELECT b.id,c.mobile,p.order_id FROM bookings b JOIN customers c ON b.customer_id=c.id JOIN payments p ON p.booking_id=b.id WHERE b.request_key=?",
       input.requestKey,
     );
@@ -236,7 +251,7 @@ export function createBooking(input, onlineEnabled) {
         fail(409, "Booking request already used.");
       return { id: existing.id, existing: true };
     }
-    const q = quote(input);
+    const q = await quote(input);
     const method = q.total === 0 ? "cash" : input.method;
     if (input.expectedTotal !== undefined && q.total !== input.expectedTotal)
       fail(
@@ -245,21 +260,25 @@ export function createBooking(input, onlineEnabled) {
       );
     if (method === "online" && !onlineEnabled)
       fail(503, "Online payments are not configured. Choose Cash on Service.");
-    if (!slots(input.date, q.duration).includes(input.time))
+    if (!(await slots(input.date, q.duration)).includes(input.time))
       fail(409, "This slot is no longer available. Please choose another.");
-    if (customerHasOverlap(input.mobile, input.date, input.time, q.duration))
+    if (
+      await customerHasOverlap(input.mobile, input.date, input.time, q.duration)
+    )
       fail(409, "You already have an appointment that overlaps this slot.");
     const customer = Number(
-      run(
-        "INSERT INTO customers(name,mobile,email) VALUES(?,?,?)",
-        input.name,
-        input.mobile,
-        input.email,
+      (
+        await run(
+          "INSERT INTO customers(name,mobile,email) VALUES(?,?,?) RETURNING id",
+          input.name,
+          input.mobile,
+          input.email,
+        )
       ).lastInsertRowid,
     );
     const id = "MN-" + randomBytes(6).toString("hex").toUpperCase();
     const now = Date.now();
-    run(
+    await run(
       "INSERT INTO bookings(id,customer_id,date,time,duration,status,method,subtotal,discount,total,coupon_id,coupon_code,instructions,created,hold_until,request_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
       id,
       customer,
@@ -284,7 +303,7 @@ export function createBooking(input, onlineEnabled) {
       input.requestKey,
     );
     for (const line of q.items)
-      run(
+      await run(
         "INSERT INTO booking_items(booking_id,service_id,package_id,name,quantity,price,duration) VALUES(?,?,?,?,?,?,?)",
         id,
         line.kind === "service" ? line.id : null,
@@ -294,7 +313,7 @@ export function createBooking(input, onlineEnabled) {
         line.price,
         line.duration,
       );
-    run(
+    await run(
       "INSERT INTO payments(booking_id,amount,state,updated) VALUES(?,?,?,?)",
       id,
       q.total,

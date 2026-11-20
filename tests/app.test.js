@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID, randomBytes, createHmac } from "node:crypto";
@@ -17,6 +17,10 @@ const env = {
   ...process.env,
   PORT: "0",
   DATA_DIR: dir,
+  DATABASE_URL: process.env.TEST_DATABASE_URL || "",
+  REQUIRE_DATABASE_URL: "0",
+  ADMIN_BOOTSTRAP_EMAIL: "",
+  ADMIN_BOOTSTRAP_PASSWORD: "",
   DB_PATH: join(dir, "test.sqlite"),
   COOKIE_SECURE: "0",
   DEMO_MODE: "0",
@@ -28,26 +32,27 @@ const env = {
 };
 let server, base;
 before(async () => {
-  for (const [account, role] of [
-    [email, "admin"],
-    [viewer, "viewer"],
-  ]) {
-    const r = spawnSync(process.execPath, ["server/create-admin.js"], {
-      env: {
-        ...env,
-        ADMIN_EMAIL: account,
-        ADMIN_PASSWORD: password,
-        ADMIN_ROLE: role,
-      },
-    });
-    assert.equal(r.status, 0, r.stderr.toString());
-  }
   const build = spawnSync("npm", ["run", "build"], { encoding: "utf8" });
   assert.equal(build.status, 0, build.stderr);
+  await startServer({
+    ADMIN_BOOTSTRAP_EMAIL: email,
+    ADMIN_BOOTSTRAP_PASSWORD: password,
+  });
+  const r = spawnSync(process.execPath, ["server/create-admin.js"], {
+    env: {
+      ...env,
+      ADMIN_EMAIL: viewer,
+      ADMIN_PASSWORD: password,
+      ADMIN_ROLE: "viewer",
+    },
+  });
+  assert.equal(r.status, 0, r.stderr.toString());
+});
+async function startServer(overrides = {}) {
   server = spawn(
     process.execPath,
     ["--import", "./tests/mock-razorpay.js", "server/index.js"],
-    { env, stdio: ["ignore", "pipe", "pipe"] },
+    { env: { ...env, ...overrides }, stdio: ["ignore", "pipe", "pipe"] },
   );
   let details = "";
   server.stderr.on("data", (b) => {
@@ -71,12 +76,15 @@ before(async () => {
     });
   });
   base = `http://127.0.0.1:${port}`;
-});
-after(async () => {
+}
+async function stopServer() {
   if (server && server.exitCode === null) {
     server.kill();
     await once(server, "exit");
   }
+}
+after(async () => {
+  await stopServer();
   rmSync(dir, { recursive: true, force: true });
 });
 async function call(path, { method = "GET", body, cookie, headers = {} } = {}) {
@@ -475,4 +483,34 @@ test("dismissed and failed online attempts remain unpaid and reuse their stored 
   assert.equal(lookup.data.payment_status, "failed");
   assert.equal(lookup.data.status, "awaiting_payment");
   assert.equal(lookup.data.payment_id, null);
+});
+
+test("uploaded images survive backend restarts", async () => {
+  const cookie = await login(email);
+  const image = readFileSync(
+    new URL("../public/app-icons/icon-192.png", import.meta.url),
+  );
+  const response = await call("/admin/upload", {
+    method: "POST",
+    cookie,
+    body: { data: `data:image/png;base64,${image.toString("base64")}` },
+  });
+  assert.equal(response.status, 201);
+  await stopServer();
+  await startServer();
+  const downloaded = await fetch(base + response.data.url);
+  assert.equal(downloaded.status, 200);
+  assert.equal(downloaded.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), image);
+  const session = await call("/admin/session", { cookie });
+  assert.equal(session.data.email, email);
+});
+
+test("requires persistent configuration on hosts that cannot retain local files", () => {
+  const r = spawnSync(process.execPath, ["server/index.js"], {
+    env: { ...env, DATABASE_URL: "", REQUIRE_DATABASE_URL: "1" },
+    encoding: "utf8",
+  });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /DATABASE_URL is required/);
 });

@@ -1,46 +1,121 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import pg from "pg";
+import { sqliteSchema, postgresSchema } from "./schema.js";
 
 export const dataDir = resolve(process.env.DATA_DIR || "data");
-const dbPath = process.env.DB_PATH || resolve(dataDir, "salon.sqlite");
-if (dbPath !== ":memory:")
-  mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
-export const db = new DatabaseSync(dbPath);
-db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'admin' CHECK(role IN ('admin','viewer')));
-CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-CREATE TABLE IF NOT EXISTS services(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL REFERENCES categories(id), name TEXT NOT NULL, description TEXT NOT NULL, image TEXT NOT NULL, price INTEGER NOT NULL CHECK(price > 0), discount INTEGER CHECK(discount > 0 AND discount < price), duration INTEGER NOT NULL CHECK(duration > 0), enabled INTEGER NOT NULL DEFAULT 1, sort INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS packages(id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, image TEXT NOT NULL, price INTEGER NOT NULL CHECK(price > 0), discount INTEGER CHECK(discount > 0 AND discount < price), enabled INTEGER NOT NULL DEFAULT 1, sort INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS package_services(package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE, service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE RESTRICT, PRIMARY KEY(package_id,service_id));
-CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, mobile TEXT NOT NULL, email TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS coupons(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, type TEXT NOT NULL CHECK(type IN ('fixed','percent')), amount INTEGER NOT NULL, expires TEXT NOT NULL DEFAULT '', minimum INTEGER NOT NULL DEFAULT 0, max_discount INTEGER, usage_limit INTEGER, enabled INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS bookings(id TEXT PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id), date TEXT NOT NULL, time TEXT NOT NULL, duration INTEGER NOT NULL, status TEXT NOT NULL, method TEXT NOT NULL, subtotal INTEGER NOT NULL, discount INTEGER NOT NULL, total INTEGER NOT NULL, coupon_id INTEGER REFERENCES coupons(id) ON DELETE SET NULL, coupon_code TEXT NOT NULL DEFAULT '', instructions TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, hold_until INTEGER, request_key TEXT NOT NULL UNIQUE);
-CREATE INDEX IF NOT EXISTS customer_mobile ON customers(mobile);
-CREATE INDEX IF NOT EXISTS booking_date ON bookings(date,status);
-CREATE INDEX IF NOT EXISTS booking_coupon ON bookings(coupon_id,status);
-CREATE TABLE IF NOT EXISTS booking_items(id INTEGER PRIMARY KEY, booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE CASCADE, service_id INTEGER REFERENCES services(id) ON DELETE SET NULL, package_id INTEGER REFERENCES packages(id) ON DELETE SET NULL, name TEXT NOT NULL, quantity INTEGER NOT NULL, price INTEGER NOT NULL, duration INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS payments(booking_id TEXT PRIMARY KEY REFERENCES bookings(id) ON DELETE CASCADE, order_id TEXT UNIQUE, payment_id TEXT UNIQUE, amount INTEGER NOT NULL, state TEXT NOT NULL, updated INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS availability(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS salon_settings(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS notification_deliveries(booking_id TEXT NOT NULL REFERENCES bookings(id) ON DELETE CASCADE, kind TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(booking_id,kind));
-`);
-export const all = (sql, ...args) => db.prepare(sql).all(...args);
-export const one = (sql, ...args) => db.prepare(sql).get(...args);
-export const run = (sql, ...args) => db.prepare(sql).run(...args);
-export function tx(fn) {
-  db.exec("BEGIN IMMEDIATE");
+export const isPostgres = Boolean(process.env.DATABASE_URL);
+const requirePostgres = process.env.REQUIRE_DATABASE_URL === "1";
+if (requirePostgres && !isPostgres)
+  throw new Error(
+    "DATABASE_URL is required; local SQLite would lose changes on this host.",
+  );
+if (isPostgres && process.env.DEMO_MODE === "1")
+  throw new Error("Demo mode cannot seed a remote database.");
+let url = null;
+if (isPostgres) {
   try {
-    const val = fn();
-    db.exec("COMMIT");
-    return val;
-  } catch (e) {
-    db.exec("ROLLBACK");
-    throw e;
+    url = new URL(process.env.DATABASE_URL);
+  } catch {
+    throw new Error(
+      "DATABASE_URL is not a valid PostgreSQL connection string.",
+    );
   }
 }
+if (url && !["postgres:", "postgresql:"].includes(url.protocol))
+  throw new Error("DATABASE_URL must be a PostgreSQL connection string.");
+if (requirePostgres) url.searchParams.set("sslmode", "verify-full");
+const pool = url
+  ? new pg.Pool({
+      connectionString: url.href,
+      max: 4,
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 10000,
+      types: {
+        getTypeParser(oid, format) {
+          if (oid === 20 && (!format || format === "text")) return Number;
+          return pg.types.getTypeParser(oid, format);
+        },
+      },
+    })
+  : null;
+pool?.on("error", (error) =>
+  console.error("Postgres idle connection error:", error.code || error.name),
+);
+
+const dbPath = process.env.DB_PATH || resolve(dataDir, "salon.sqlite");
+if (!pool && dbPath !== ":memory:")
+  mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+export const db = pool ? null : new DatabaseSync(dbPath);
+db?.exec(
+  "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+);
+const context = new AsyncLocalStorage();
+let sqliteQueue = Promise.resolve();
+function sqliteExclusive(work) {
+  const result = sqliteQueue.then(work);
+  sqliteQueue = result.catch(() => {});
+  return result;
+}
+const pgSql = (sql) => {
+  let index = 0;
+  return sql.replace(/\?/g, () => `$${++index}`);
+};
+async function query(kind, sql, args) {
+  const connection = context.getStore();
+  if (pool) {
+    const result = await (connection || pool).query(pgSql(sql), args);
+    if (kind === "run")
+      return { changes: result.rowCount, lastInsertRowid: result.rows[0]?.id };
+    return kind === "all" ? result.rows : result.rows[0];
+  }
+  const work = () => db.prepare(sql)[kind](...args);
+  if (kind === "run" && /\bRETURNING id$/i.test(sql)) {
+    const insert = () => ({
+      lastInsertRowid: db.prepare(sql).get(...args)?.id,
+    });
+    return connection ? insert() : sqliteExclusive(insert);
+  }
+  return connection ? work() : sqliteExclusive(work);
+}
+export const all = (sql, ...args) => query("all", sql, args);
+export const one = (sql, ...args) => query("get", sql, args);
+export const run = (sql, ...args) => query("run", sql, args);
+export async function tx(fn) {
+  if (context.getStore()) return fn();
+  if (pool) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Serialize salon mutations (including slot checks) across deployments before reading the schedule.
+      await client.query("SELECT pg_advisory_xact_lock(563981, 1)");
+      const result = await context.run(client, fn);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  return sqliteExclusive(async () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = await context.run(db, fn);
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  });
+}
+export const closeDb = () => (pool ? pool.end() : db.close());
+
 export const categories = [
   "Haircut & Hairstyling",
   "Hair Spa",
@@ -54,8 +129,6 @@ export const categories = [
   "Grooming Packages",
   "Bridal Services",
 ];
-for (const cat of categories)
-  run("INSERT OR IGNORE INTO categories(name) VALUES (?)", cat);
 export const settingsDefaults = {
   name: "Maison Noir",
   logo: "",
@@ -79,18 +152,13 @@ const availabilityDefaults = {
   blockedDates: [],
   blockedSlots: [],
 };
-run(
-  "INSERT OR IGNORE INTO salon_settings VALUES(1,?)",
-  JSON.stringify(settingsDefaults),
-);
-run(
-  "INSERT OR IGNORE INTO availability VALUES(1,?)",
-  JSON.stringify(availabilityDefaults),
-);
-export const settings = () =>
-  JSON.parse(one("SELECT config FROM salon_settings WHERE id=1").config);
-export const availability = () =>
-  JSON.parse(one("SELECT config FROM availability WHERE id=1").config);
+export const settings = async () =>
+  JSON.parse(
+    (await one("SELECT config FROM salon_settings WHERE id=1")).config,
+  );
+export const availability = async () =>
+  JSON.parse((await one("SELECT config FROM availability WHERE id=1")).config);
+
 export function hashPassword(password, salt = randomBytes(16).toString("hex")) {
   return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
 }
@@ -100,22 +168,71 @@ export function checkPassword(password, hash) {
     Buffer.from(hash),
   );
 }
-export function upsertAdmin(email, password, role = "admin") {
-  run(
-    "INSERT INTO admins(email,password,role) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET password=excluded.password, role=excluded.role",
-    email,
-    hashPassword(password),
-    role,
-  );
-  run(
-    "DELETE FROM sessions WHERE admin_id IN (SELECT id FROM admins WHERE email=?)",
-    email,
-  );
+export async function upsertAdmin(email, password, role = "admin") {
+  await tx(async () => {
+    await run(
+      "INSERT INTO admins(email,password,role) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET password=excluded.password, role=excluded.role",
+      email,
+      hashPassword(password),
+      role,
+    );
+    await run(
+      "DELETE FROM sessions WHERE admin_id IN (SELECT id FROM admins WHERE email=?)",
+      email,
+    );
+  });
 }
-export function seed() {
-  if (one("SELECT COUNT(*) AS n FROM services").n) return;
-  tx(() => {
-    const add = (
+
+async function initialize() {
+  await tx(async () => {
+    if (isPostgres) await context.getStore().query(postgresSchema);
+    else db.exec(sqliteSchema);
+    await run(
+      `INSERT INTO categories(name) VALUES ${categories.map(() => "(?)").join(",")} ON CONFLICT DO NOTHING`,
+      ...categories,
+    );
+    await run(
+      "INSERT INTO salon_settings VALUES(1,?) ON CONFLICT DO NOTHING",
+      JSON.stringify(settingsDefaults),
+    );
+    await run(
+      "INSERT INTO availability VALUES(1,?) ON CONFLICT DO NOTHING",
+      JSON.stringify(availabilityDefaults),
+    );
+    const email = process.env.ADMIN_BOOTSTRAP_EMAIL?.trim().toLowerCase();
+    const password = process.env.ADMIN_BOOTSTRAP_PASSWORD;
+    if (email || password) {
+      if (
+        !email ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+        email.length > 160 ||
+        !password ||
+        password.length < 12 ||
+        password.length > 128
+      ) {
+        throw new Error(
+          "Set a valid ADMIN_BOOTSTRAP_EMAIL and an ADMIN_BOOTSTRAP_PASSWORD of 12–128 characters, or remove both.",
+        );
+      }
+      const changed = await run(
+        "INSERT INTO admins(email,password) SELECT ?,? WHERE NOT EXISTS (SELECT 1 FROM admins) ON CONFLICT DO NOTHING",
+        email,
+        hashPassword(password),
+      );
+      if (changed.changes)
+        console.log(
+          "First admin created. Remove the bootstrap environment variables.",
+        );
+    }
+  });
+}
+
+await initialize();
+
+export async function seed() {
+  await tx(async () => {
+    if ((await one("SELECT COUNT(*) AS n FROM services")).n) return;
+    const add = async (
       category,
       name,
       description,
@@ -126,19 +243,21 @@ export function seed() {
       sort,
     ) =>
       Number(
-        run(
-          "INSERT INTO services(category_id,name,description,image,price,discount,duration,sort) VALUES(?,?,?,?,?,?,?,?)",
-          category,
-          name,
-          description,
-          image,
-          price,
-          discount,
-          duration,
-          sort,
+        (
+          await run(
+            "INSERT INTO services(category_id,name,description,image,price,discount,duration,sort) VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+            category,
+            name,
+            description,
+            image,
+            price,
+            discount,
+            duration,
+            sort,
+          )
         ).lastInsertRowid,
       );
-    const hair = add(
+    const hair = await add(
       1,
       "Signature Haircut",
       "A precision cut, expertly styled to suit you. Includes a wash and finish.",
@@ -148,7 +267,7 @@ export function seed() {
       45,
       1,
     );
-    const beard = add(
+    const beard = await add(
       4,
       "Beard Sculpt & Shave",
       "Defined lines, a tailored trim, and a relaxing hot-towel finish.",
@@ -158,7 +277,7 @@ export function seed() {
       30,
       2,
     );
-    const face = add(
+    const face = await add(
       5,
       "Deep Cleanse Facial",
       "A refreshing facial that cleanses, exfoliates, and restores your natural glow.",
@@ -168,7 +287,7 @@ export function seed() {
       60,
       3,
     );
-    add(
+    await add(
       2,
       "Restorative Hair Spa",
       "A nourishing scalp massage and conditioning ritual for healthier-looking hair.",
@@ -178,22 +297,32 @@ export function seed() {
       45,
       4,
     );
-    const combo = (name, description, image, price, discount, ids, sort) => {
+    const combo = async (
+      name,
+      description,
+      image,
+      price,
+      discount,
+      ids,
+      sort,
+    ) => {
       const id = Number(
-        run(
-          "INSERT INTO packages(name,description,image,price,discount,sort) VALUES(?,?,?,?,?,?)",
-          name,
-          description,
-          image,
-          price,
-          discount,
-          sort,
+        (
+          await run(
+            "INSERT INTO packages(name,description,image,price,discount,sort) VALUES(?,?,?,?,?,?) RETURNING id",
+            name,
+            description,
+            image,
+            price,
+            discount,
+            sort,
+          )
         ).lastInsertRowid,
       );
       for (const item of ids)
-        run("INSERT INTO package_services VALUES(?,?)", id, item);
+        await run("INSERT INTO package_services VALUES(?,?)", id, item);
     };
-    combo(
+    await combo(
       "The Signature Duo",
       "A precision haircut and beard sculpt, all in one visit.",
       "/images/beard.jpg",
@@ -202,7 +331,7 @@ export function seed() {
       [hair, beard],
       1,
     );
-    combo(
+    await combo(
       "The Noir Ritual",
       "Our signature cut, beard sculpt, and deep cleanse facial.",
       "/images/salon.jpg",
@@ -211,10 +340,10 @@ export function seed() {
       [hair, beard, face],
       2,
     );
-    run(
+    await run(
       "INSERT INTO coupons(code,type,amount,minimum,usage_limit) VALUES('FIRST10','percent',10,50000,500)",
     );
-    run(
+    await run(
       "UPDATE salon_settings SET config=? WHERE id=1",
       JSON.stringify({
         ...settingsDefaults,
