@@ -1,0 +1,42 @@
+{
+  "name": "maison-noir",
+  "version": "1.0.0",
+  "description": "Maison Noir salon booking and management",
+  "main": "server/index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "dev": "node --env-file-if-exists=.env server/index.js --dev",
+    "build": "vite build",
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "admin:create": "node --env-file-if-exists=.env server/create-admin.js",
+    "backup": "node --env-file-if-exists=.env server/backup.js",
+    "preview": "npm run build && node server/index.js --preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Analoggeek/SaloonAPP.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Analoggeek/SaloonAPP/issues"
+  },
+  "homepage": "https://github.com/Analoggeek/SaloonAPP#readme",
+  "dependencies": {
+    "@fontsource/dm-sans": "^5.3.0",
+    "@fontsource/playfair-display": "^5.3.0",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.5",
+    "helmet": "^8.3.0",
+    "lucide-react": "^1.77.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "vite": "^8.3.8",
+    "zod": "^4.6.7"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  }
+}
