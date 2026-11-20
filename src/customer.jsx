@@ -1095,6 +1095,7 @@ export default function Customer() {
             <button onClick={startBooking}>Book appointment</button>
             <button onClick={() => open("track")}>Track a booking</button>
             <a href="#contact">Contact</a>
+            <a href="/install.html">Install Android app</a>
           </div>
           <div>
             <strong>FOLLOW</strong>

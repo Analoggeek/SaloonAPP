@@ -8,11 +8,38 @@
       content="Maison Noir — expert salon grooming, timeless style, and easy appointment booking."
     />
     <meta name="theme-color" content="#161512" />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="./public/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./pages/landing.css" />
+    <!-- live-app-head -->
     <title>Maison Noir · Salon & Grooming</title>
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+    <div id="root">
+      <main class="noir-launch" data-noir-gateway>
+        <header>
+          <img src="./public/favicon.svg" width="43" height="43" alt="" />
+          <div>Maison Noir<small>SALON &amp; GROOMING</small></div>
+        </header>
+        <section>
+          <p class="noir-launch-kicker">THE ART OF GROOMING</p>
+          <h1>Look Good.<br /><em>Feel Great.</em></h1>
+          <p>Expert grooming, timeless style, and a moment to make your own.</p>
+          <p class="noir-launch-status" data-booking-status role="status">
+            Online booking is not available from this page yet. Please check
+            back soon.
+          </p>
+          <div class="noir-launch-actions">
+            <a data-booking-link hidden
+              >Open booking website <span aria-hidden="true">↗</span></a
+            >
+            <a data-installer-link hidden
+              >Get the Android app <span aria-hidden="true">↗</span></a
+            >
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="./pages/launch.js"></script>
+    <!-- live-app-entry -->
   </body>
 </html>

@@ -10,6 +10,15 @@ import "@fontsource/playfair-display/latin-500-italic.css";
 import "./style.css";
 const admin =
   location.pathname === "/admin" || location.pathname.startsWith("/admin/");
+if (
+  !admin &&
+  import.meta.env.PROD &&
+  window.isSecureContext &&
+  window.top === window &&
+  "serviceWorker" in navigator
+) {
+  navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+}
 const { default: App } = await (admin
   ? import("./admin.jsx")
   : import("./customer.jsx"));

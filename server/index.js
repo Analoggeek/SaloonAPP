@@ -274,6 +274,10 @@ if (dev) {
       maxAge: "1y",
     }),
   );
+  app.get("/service-worker.js", (_req, res) => {
+    res.set("Cache-Control", "no-cache");
+    res.sendFile(resolve("dist/service-worker.js"));
+  });
   app.use(
     express.static("dist", { index: false, maxAge: "1d", redirect: false }),
   );
