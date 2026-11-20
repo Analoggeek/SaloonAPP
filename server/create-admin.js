@@ -1,4 +1,4 @@
-import { upsertAdmin } from "./db.js";
+import { upsertAdmin, closeDb } from "./db.js";
 const email = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 const password = process.env.ADMIN_PASSWORD || "";
 const role = process.env.ADMIN_ROLE || "admin";
@@ -13,5 +13,9 @@ if (
   );
   process.exit(1);
 }
-upsertAdmin(email, password, role);
+try {
+  await upsertAdmin(email, password, role);
+} finally {
+  await closeDb();
+}
 console.log("Admin saved; previous sessions revoked.");

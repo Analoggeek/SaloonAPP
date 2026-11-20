@@ -3,23 +3,24 @@ services:
     name: maison-noir-salon
     runtime: node
     region: singapore
-    plan: starter
-    numInstances: 1
+    plan: free
     buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /healthz
-    disk:
-      name: salon-data
-      mountPath: /var/data
-      sizeGB: 2
     envVars:
       - key: NODE_VERSION
         value: 22.22.3
       - key: NODE_ENV
         value: production
-      - key: DATA_DIR
-        value: /var/data
+      - key: REQUIRE_DATABASE_URL
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_BOOTSTRAP_EMAIL
+        sync: false
+      - key: ADMIN_BOOTSTRAP_PASSWORD
+        sync: false
       - key: TRUST_PROXY
-        value: '1'
+        value: "1"
       - key: COOKIE_SECURE
-        value: '1'
+        value: "1"

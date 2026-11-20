@@ -1,8 +1,6 @@
 import express from "express";
 import { z } from "zod";
 import { randomBytes, createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { rateLimit } from "express-rate-limit";
 import {
   all,
@@ -13,7 +11,7 @@ import {
   availability,
   hashPassword,
   checkPassword,
-  dataDir,
+  isPostgres,
 } from "./db.js";
 import {
   booking,
@@ -52,21 +50,21 @@ const loginLimit = rateLimit({
   message: { error: "Too many login attempts. Try again later." },
   skipSuccessfulRequests: true,
 });
-admin.post("/login", loginLimit, (req, res) => {
+admin.post("/login", loginLimit, async (req, res) => {
   const { email, password } = z
     .object({
       email: z.string().trim().toLowerCase().max(160),
       password: z.string().max(128),
     })
     .parse(req.body);
-  const a = one("SELECT * FROM admins WHERE email=?", email);
+  const a = await one("SELECT * FROM admins WHERE email=?", email);
   if (!checkPassword(password, a?.password ?? dummyHash) || !a)
     fail(401, "Incorrect email or password.");
   const token = randomBytes(32).toString("hex");
-  run("DELETE FROM sessions WHERE expires<?", Date.now());
+  await run("DELETE FROM sessions WHERE expires<?", Date.now());
   const old = tokenOf(req);
-  if (old) run("DELETE FROM sessions WHERE token=?", hash(old));
-  run(
+  if (old) await run("DELETE FROM sessions WHERE token=?", hash(old));
+  await run(
     "INSERT INTO sessions VALUES(?,?,?)",
     hash(token),
     a.id,
@@ -76,15 +74,15 @@ admin.post("/login", loginLimit, (req, res) => {
     .cookie(cookieName, token, { ...cookieOpts, maxAge: ttl })
     .json({ email: a.email, role: a.role });
 });
-admin.use((req, res, next) => {
+admin.use(async (req, res, next) => {
   const token = tokenOf(req);
   const a =
     token &&
-    one(
+    (await one(
       "SELECT a.id,a.email,a.role,s.expires FROM admins a JOIN sessions s ON s.admin_id=a.id WHERE s.token=? AND s.expires>?",
       hash(token),
       Date.now(),
-    );
+    ));
   if (!a) fail(401, "Please sign in to access the dashboard.");
   req.admin = a;
   if (
@@ -107,38 +105,28 @@ admin.get("/events", (req, res) => {
   res.flushHeaders();
   res.write(": connected\n\n");
   const token = hash(tokenOf(req));
-  const send = () => {
-    if (
-      !one(
-        "SELECT token FROM sessions WHERE token=? AND expires>?",
-        token,
-        Date.now(),
-      )
-    ) {
-      res.end();
-      return;
-    }
-    res.write("event: booking\ndata: updated\n\n");
-  };
-  const pulse = setInterval(() => {
-    if (
-      !one(
-        "SELECT token FROM sessions WHERE token=? AND expires>?",
-        token,
-        Date.now(),
-      )
+  const writeIfSignedIn = (message) => {
+    void one(
+      "SELECT token FROM sessions WHERE token=? AND expires>?",
+      token,
+      Date.now(),
     )
-      res.end();
-    else res.write(": heartbeat\n\n");
-  }, 20_000);
+      .then((session) => {
+        if (!session) res.end();
+        else if (!res.destroyed && !res.writableEnded) res.write(message);
+      })
+      .catch(() => res.end());
+  };
+  const send = () => writeIfSignedIn("event: booking\ndata: updated\n\n");
+  const pulse = setInterval(() => writeIfSignedIn(": heartbeat\n\n"), 20_000);
   changes.on("booking", send);
   res.on("close", () => {
     clearInterval(pulse);
     changes.off("booking", send);
   });
 });
-admin.post("/logout", (req, res) => {
-  run("DELETE FROM sessions WHERE token=?", hash(tokenOf(req)));
+admin.post("/logout", async (req, res) => {
+  await run("DELETE FROM sessions WHERE token=?", hash(tokenOf(req)));
   res.clearCookie(cookieName, cookieOpts).json({ ok: true });
 });
 const statuses = [
@@ -159,7 +147,7 @@ const listSchema = z.object({
   date: date.optional(),
   page: z.coerce.number().int().min(1).max(1_000_000).default(1),
 });
-function bookingList(query, limit) {
+async function bookingList(query, limit) {
   const f = listSchema.parse(query);
   const where = [],
     params = [];
@@ -178,11 +166,13 @@ function bookingList(query, limit) {
     where.push(`(${effective})=?`);
     params.push(Date.now(), f.status);
   }
-  return all(
-    `SELECT ${bookingColumns}, (${effective}) effective_status, (SELECT GROUP_CONCAT(name || ' × ' || quantity, ', ') FROM booking_items WHERE booking_id=b.id) services ${bookingJoin} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY b.created DESC, b.id DESC ${limit ? "LIMIT 51 OFFSET ?" : ""}`,
-    Date.now(),
-    ...params,
-    ...(limit ? [(f.page - 1) * 50] : []),
+  return (
+    await all(
+      `SELECT ${bookingColumns}, (${effective}) effective_status, (SELECT ${isPostgres ? "STRING_AGG(name || ' × ' || quantity, ', ' ORDER BY id)" : "GROUP_CONCAT(name || ' × ' || quantity, ', ')"} FROM booking_items WHERE booking_id=b.id) services ${bookingJoin} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY b.created DESC, b.id DESC ${limit ? "LIMIT 51 OFFSET ?" : ""}`,
+      Date.now(),
+      ...params,
+      ...(limit ? [(f.page - 1) * 50] : []),
+    )
   ).map((b) => {
     const {
       effective_status,
@@ -202,8 +192,10 @@ function bookingList(query, limit) {
     };
   });
 }
-admin.get("/bookings", (req, res) => res.json(bookingList(req.query, true)));
-admin.get("/bookings.csv", (req, res) => {
+admin.get("/bookings", async (req, res) =>
+  res.json(await bookingList(req.query, true)),
+);
+admin.get("/bookings.csv", async (req, res) => {
   const fields = [
     "id",
     "name",
@@ -229,7 +221,7 @@ admin.get("/bookings.csv", (req, res) => {
       "\uFEFF" +
         [
           fields.join(","),
-          ...bookingList(req.query, false).map((b) =>
+          ...(await bookingList(req.query, false)).map((b) =>
             fields
               .map((k) => csv(k === "total" ? (b[k] / 100).toFixed(2) : b[k]))
               .join(","),
@@ -237,8 +229,8 @@ admin.get("/bookings.csv", (req, res) => {
         ].join("\r\n"),
     );
 });
-admin.get("/bookings/:id", (req, res) => {
-  const b = booking(req.params.id, true);
+admin.get("/bookings/:id", async (req, res) => {
+  const b = await booking(req.params.id, true);
   if (!b) fail(404, "Booking not found.");
   res.json(b);
 });
@@ -252,7 +244,7 @@ const transitions = {
   payment_expired: ["cancelled"],
   payment_review: [],
 };
-admin.patch("/bookings/:id", (req, res) => {
+admin.patch("/bookings/:id", async (req, res) => {
   const update = z
     .object({
       date,
@@ -261,8 +253,8 @@ admin.patch("/bookings/:id", (req, res) => {
       notes: z.string().max(2000),
     })
     .parse(req.body);
-  tx(() => {
-    const b = booking(req.params.id, true);
+  await tx(async () => {
+    const b = await booking(req.params.id, true);
     if (!b) fail(404, "Booking not found.");
     if (
       b.status !== update.status &&
@@ -274,24 +266,30 @@ admin.patch("/bookings/:id", (req, res) => {
       moving &&
       (!["pending", "confirmed"].includes(b.status) ||
         !["pending", "confirmed"].includes(update.status) ||
-        !slots(update.date, b.duration, b.id).includes(update.time))
+        !(await slots(update.date, b.duration, b.id)).includes(update.time))
     )
       fail(409, "This appointment cannot be moved to the chosen slot.");
     if (
       moving &&
-      customerHasOverlap(b.mobile, update.date, update.time, b.duration, b.id)
+      (await customerHasOverlap(
+        b.mobile,
+        update.date,
+        update.time,
+        b.duration,
+        b.id,
+      ))
     )
       fail(409, "This customer already has an overlapping appointment.");
     if (
       b.status === "pending" &&
       update.status === "confirmed" &&
-      !slots(update.date, b.duration, b.id).includes(update.time)
+      !(await slots(update.date, b.duration, b.id)).includes(update.time)
     )
       fail(
         409,
         "This slot is no longer available. Reschedule the appointment before confirming.",
       );
-    run(
+    await run(
       "UPDATE bookings SET date=?,time=?,notes=?,status=? WHERE id=?",
       update.date,
       update.time,
@@ -300,7 +298,7 @@ admin.patch("/bookings/:id", (req, res) => {
       b.id,
     );
     if (update.status === "cancelled" && b.method === "online")
-      run(
+      await run(
         "UPDATE payments SET state='cancelled',updated=? WHERE booking_id=? AND state NOT IN ('paid','paid_review')",
         Date.now(),
         b.id,
@@ -310,47 +308,51 @@ admin.patch("/bookings/:id", (req, res) => {
       b.method === "cash" &&
       b.payment_status === "unpaid"
     )
-      run(
+      await run(
         "UPDATE payments SET state='paid',updated=? WHERE booking_id=?",
         Date.now(),
         b.id,
       );
   });
   changes.emit("booking");
-  const b = booking(req.params.id);
-  if (b.status === "confirmed") void notify(b.id);
+  const b = await booking(req.params.id);
+  if (b.status === "confirmed") notify(b.id);
   res.json(b);
 });
-admin.get("/stats", (req, res) => {
+admin.get("/stats", async (req, res) => {
   const day = today();
-  const stats = one(
-    `SELECT COUNT(*) total, COUNT(CASE WHEN b.date=? AND b.status IN ('pending','confirmed','completed') THEN 1 END) today, COUNT(CASE WHEN b.status='pending' THEN 1 END) pending, COUNT(CASE WHEN b.status='confirmed' THEN 1 END) confirmed, COUNT(CASE WHEN b.status='completed' THEN 1 END) completed, COUNT(CASE WHEN b.status IN ('cancelled','rejected') THEN 1 END) cancelled, COALESCE(SUM(CASE WHEN p.state='paid' THEN p.amount END),0) revenue, COALESCE(SUM(CASE WHEN p.state='paid' AND b.method='online' THEN p.amount END),0) online, COALESCE(SUM(CASE WHEN p.state='paid' AND b.method='cash' THEN p.amount END),0) cash ${bookingJoin}`,
+  const stats = await one(
+    `SELECT COUNT(*) total, COUNT(CASE WHEN b.date=? AND b.status IN ('pending','confirmed','completed') THEN 1 END) today, COUNT(CASE WHEN b.status='pending' THEN 1 END) pending, COUNT(CASE WHEN b.status='confirmed' THEN 1 END) confirmed, COUNT(CASE WHEN b.status='completed' THEN 1 END) completed, COUNT(CASE WHEN b.status IN ('cancelled','rejected') THEN 1 END) cancelled, CAST(COALESCE(SUM(CASE WHEN p.state='paid' THEN p.amount END),0) AS BIGINT) revenue, CAST(COALESCE(SUM(CASE WHEN p.state='paid' AND b.method='online' THEN p.amount END),0) AS BIGINT) online, CAST(COALESCE(SUM(CASE WHEN p.state='paid' AND b.method='cash' THEN p.amount END),0) AS BIGINT) cash ${bookingJoin}`,
     day,
   );
-  const daily = [];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(`${day}T00:00:00Z`);
-    d.setUTCDate(d.getUTCDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    const start = Date.parse(`${key}T00:00:00+05:30`);
-    daily.push({
-      date: key,
-      count: one(
-        "SELECT COUNT(*) n FROM bookings WHERE created>=? AND created<?",
-        start,
-        start + 86400000,
-      ).n,
-      revenue: one(
-        "SELECT COALESCE(SUM(amount),0) n FROM payments WHERE state='paid' AND updated>=? AND updated<?",
-        start,
-        start + 86400000,
-      ).n,
-    });
-  }
+  const dayMs = 86_400_000;
+  const start = Date.parse(`${day}T00:00:00+05:30`) - 6 * dayMs;
+  const end = start + 7 * dayMs;
+  const [counts, totals] = await Promise.all([
+    all(
+      "SELECT CAST((created-?)/86400000 AS INTEGER) AS bucket, COUNT(*) n FROM bookings WHERE created>=? AND created<? GROUP BY 1",
+      start,
+      start,
+      end,
+    ),
+    all(
+      "SELECT CAST((updated-?)/86400000 AS INTEGER) AS bucket, CAST(SUM(amount) AS BIGINT) n FROM payments WHERE state='paid' AND updated>=? AND updated<? GROUP BY 1",
+      start,
+      start,
+      end,
+    ),
+  ]);
+  const daily = Array.from({ length: 7 }, (_, bucket) => ({
+    date: new Date(Date.parse(`${day}T00:00:00Z`) + (bucket - 6) * dayMs)
+      .toISOString()
+      .slice(0, 10),
+    count: counts.find((row) => row.bucket === bucket)?.n ?? 0,
+    revenue: totals.find((row) => row.bucket === bucket)?.n ?? 0,
+  }));
   res.json({ ...stats, daily });
 });
 const ext = { jpeg: "jpg", png: "png", webp: "webp" };
-admin.post("/upload", (req, res) => {
+admin.post("/upload", async (req, res) => {
   const { data } = z
     .object({ data: z.string().max(4_200_000) })
     .parse(req.body);
@@ -367,10 +369,8 @@ admin.post("/upload", (req, res) => {
           buf.toString("ascii", 8, 12) === "WEBP";
   if (!valid || buf.length > 3_000_000)
     fail(400, "Invalid image or file too large.");
-  const dir = resolve(dataDir, "uploads");
-  mkdirSync(dir, { recursive: true });
   const name = `${randomBytes(18).toString("hex")}.${ext[type]}`;
-  writeFileSync(resolve(dir, name), buf, { flag: "wx" });
+  await run("INSERT INTO uploaded_images(name,content) VALUES(?,?)", name, buf);
   res.status(201).json({ url: `/uploads/${name}` });
 });
 const image = z
@@ -429,10 +429,10 @@ const couponSchema = z
     (v) => v.type !== "percent" || v.amount <= 100,
     "Percentage cannot exceed 100.",
   );
-admin.get("/catalog", (req, res) =>
+admin.get("/catalog", async (req, res) =>
   res.json({
-    ...catalog(true),
-    coupons: all("SELECT * FROM coupons ORDER BY id DESC"),
+    ...(await catalog(true)),
+    coupons: await all("SELECT * FROM coupons ORDER BY id DESC"),
   }),
 );
 for (const [table, schema] of Object.entries({
@@ -440,53 +440,60 @@ for (const [table, schema] of Object.entries({
   packages: pkgSchema,
   coupons: couponSchema,
 })) {
-  const save = (req, res) => {
+  const save = async (req, res) => {
     const { serviceIds, ...data } = schema.parse(req.body);
-    const id = tx(() => {
+    const id = await tx(async () => {
       let key = req.params.id
         ? z.coerce.number().int().positive().parse(req.params.id)
         : null;
-      if (
-        serviceIds &&
-        serviceIds.some((i) => !one("SELECT id FROM services WHERE id=?", i))
-      )
-        fail(400, "One or more included services no longer exist.");
+      if (serviceIds) {
+        const found = await all(
+          `SELECT id FROM services WHERE id IN (${serviceIds.map(() => "?").join(",")})`,
+          ...serviceIds,
+        );
+        if (found.length !== serviceIds.length)
+          fail(400, "One or more included services no longer exist.");
+      }
       if (
         data.category_id &&
-        !one("SELECT id FROM categories WHERE id=?", data.category_id)
+        !(await one("SELECT id FROM categories WHERE id=?", data.category_id))
       )
         fail(400, "Invalid category.");
       if (
         table === "coupons" &&
-        one(
+        (await one(
           "SELECT id FROM coupons WHERE code=? AND id<>?",
           data.code,
           key ?? 0,
-        )
+        ))
       )
         fail(409, "This coupon code already exists.");
       const keys = Object.keys(data),
         values = Object.values(data);
       if (key) {
         if (
-          !run(
-            `UPDATE ${table} SET ${keys.map((k) => `${k}=?`).join(",")} WHERE id=?`,
-            ...values,
-            key,
+          !(
+            await run(
+              `UPDATE ${table} SET ${keys.map((k) => `${k}=?`).join(",")} WHERE id=?`,
+              ...values,
+              key,
+            )
           ).changes
         )
           fail(404, "Record not found.");
       } else
         key = Number(
-          run(
-            `INSERT INTO ${table}(${keys.join(",")}) VALUES(${keys.map(() => "?").join(",")})`,
-            ...values,
+          (
+            await run(
+              `INSERT INTO ${table}(${keys.join(",")}) VALUES(${keys.map(() => "?").join(",")}) RETURNING id`,
+              ...values,
+            )
           ).lastInsertRowid,
         );
       if (serviceIds) {
-        run("DELETE FROM package_services WHERE package_id=?", key);
+        await run("DELETE FROM package_services WHERE package_id=?", key);
         for (const i of serviceIds)
-          run("INSERT INTO package_services VALUES(?,?)", key, i);
+          await run("INSERT INTO package_services VALUES(?,?)", key, i);
       }
       return key;
     });
@@ -494,15 +501,18 @@ for (const [table, schema] of Object.entries({
   };
   admin.post(`/${table}`, save);
   admin.put(`/${table}/:id`, save);
-  admin.delete(`/${table}/:id`, (req, res) => {
+  admin.delete(`/${table}/:id`, async (req, res) => {
     const id = z.coerce.number().int().positive().parse(req.params.id);
-    tx(() => {
+    await tx(async () => {
       if (
         table === "services" &&
-        one("SELECT package_id FROM package_services WHERE service_id=?", id)
+        (await one(
+          "SELECT package_id FROM package_services WHERE service_id=?",
+          id,
+        ))
       )
         fail(409, "Remove this service from its packages before deleting it.");
-      if (!run(`DELETE FROM ${table} WHERE id=?`, id).changes)
+      if (!(await run(`DELETE FROM ${table} WHERE id=?`, id)).changes)
         fail(404, "Record not found.");
     });
     res.json({ ok: true });
@@ -546,10 +556,10 @@ const settingsSchema = z.object({
     .max(12)
     .default([]),
 });
-admin.get("/settings", (req, res) => res.json(settings()));
-admin.put("/settings", (req, res) => {
+admin.get("/settings", async (req, res) => res.json(await settings()));
+admin.put("/settings", async (req, res) => {
   const v = settingsSchema.parse(req.body);
-  run("UPDATE salon_settings SET config=? WHERE id=1", JSON.stringify(v));
+  await run("UPDATE salon_settings SET config=? WHERE id=1", JSON.stringify(v));
   res.json(v);
 });
 const availabilitySchema = z
@@ -566,9 +576,11 @@ const availabilitySchema = z
     (a) => minutes(a.close) - minutes(a.open) >= a.slot,
     "Closing hours must leave room for at least one slot.",
   );
-admin.get("/availability", (req, res) => res.json(availability()));
-admin.put("/availability", (req, res) => {
+admin.get("/availability", async (req, res) => res.json(await availability()));
+admin.put("/availability", async (req, res) => {
   const v = availabilitySchema.parse(req.body);
-  run("UPDATE availability SET config=? WHERE id=1", JSON.stringify(v));
+  await tx(() =>
+    run("UPDATE availability SET config=? WHERE id=1", JSON.stringify(v)),
+  );
   res.json(v);
 });

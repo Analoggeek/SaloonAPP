@@ -1,6 +1,6 @@
 # Maison Noir · Salon & Grooming
 
-A guest-booking storefront at `/` and a separate, authenticated staff dashboard at `/admin`. Both use the same Express API and SQLite database. The React interfaces share an HTTPS origin; there is no separate browser-facing API host.
+A guest-booking storefront at `/` and a separate, authenticated staff dashboard at `/admin`. Both use the same Express API and database: SQLite locally, or PostgreSQL on hosted instances. The React interfaces share an HTTPS origin; there is no separate browser-facing API host.
 
 ## Run locally
 
@@ -49,20 +49,20 @@ This preview uses sample services and a sample coupon (`FIRST10`), but still run
 - **Home-screen app (no APK needed):** Open `/install.html` on the booking domain using Android Chrome and choose **Install app** or **Add to Home screen**. The customer website also links to these instructions in its footer. Booking and payment require an internet connection; the service worker caches only the offline notice, not customer records.
 - **Signed Android installer (`.apk`):** The GitHub Actions **Android installer** workflow builds a native launcher that opens the same HTTPS booking server in a browser tab, so booking, cookies and provider-hosted checkout are not reimplemented in the APK. Publish at least one real service, use the live server URL when dispatching the workflow, and set GitHub Actions secrets `ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. Use the same backed-up release keystore for future versions. Test the signed artifact on an Android device, then attach `maison-noir-booking.apk` to a public GitHub Release or other HTTPS download host. Put that public URL in `androidApkUrl` if customers should download the APK from Pages instead of getting Chrome installation instructions. Until the signing secrets and booking endpoint are configured, no APK is published.
 
-## Deploy to Render
+## Deploy using Render Free and Neon Free
 
-The root `render.yaml` provisions one paid Starter web service in Singapore and a 2 GB persistent disk. Review the service and disk price in Render before applying it. The SQLite database and uploads are stored in `/var/data`.
+The root `render.yaml` asks for a single **Free** Render web service and does not create a paid plan, disk, or Render database. Bookings, sessions, and new uploads are stored in Neon Postgres, so Render restarts do not discard them. The process refuses to start on Render without its database connection rather than falling back to SQLite. Both free tiers have quotas and the first visit after inactivity may be slow; they are suitable for testing or light usage, not guaranteed 24/7 availability. Review [Render's usage and suspension limits](https://render.com/docs/free) and [Neon's Free plan limits](https://neon.com/pricing). Do not enable paid add-ons if using this zero-monthly-plan setup.
 
-1. From the [Render dashboard](https://dashboard.render.com/), choose **New → Blueprint**, give its GitHub integration access to `Analoggeek/SaloonAPP`, and select the branch containing `render.yaml`. Apply the Blueprint.
-2. After the service is healthy, open its Render **Shell** and run the interactive admin setup commands above. Use `/admin` on the assigned Render HTTPS URL to publish the actual catalog and salon details. Do not put the staff password in GitHub or in the Blueprint.
-3. Verify `/healthz`, `/admin`, and a cash test booking over HTTPS before sharing the URL. Add a custom domain and any Razorpay or Twilio environment variables in the Render dashboard when ready. Leave `DEMO_MODE` unset.
+1. In [Neon](https://console.neon.tech/), create a **Free** project and copy the **pooled** connection string from **Connect**. Use a new database for this deployment. The connection string includes the database password; keep it out of Git, messages, and screenshots.
+2. Open [Deploy to Render](https://render.com/deploy?repo=https://github.com/Analoggeek/SaloonAPP) for the `main` branch (or import the repository as a Blueprint). Select **Free** and confirm there is no paid disk or database. In the prompted environment variables, paste the connection string into `DATABASE_URL`. Set `ADMIN_BOOTSTRAP_EMAIL` and a unique `ADMIN_BOOTSTRAP_PASSWORD` (12–128 characters). Apply the Blueprint. Render Free does not provide Shell access, so these variables create the first admin on startup without needing a remote shell.
+3. After the service is live, visit `https://YOUR-SERVICE.onrender.com/admin`, sign in with that admin, and remove both `ADMIN_BOOTSTRAP_*` variables from the Render service. This does not delete or reset the account. Publish services and contact details, then verify `/healthz` and complete a cash test booking before advertising the site. Keep `DEMO_MODE` unset. Razorpay and SMS are optional and may incur separate provider fees.
+4. Set `bookingUrl` in `public/booking-links.json` to the live HTTPS origin (public URL only), and publish that change to `main` to enable the GitHub Pages booking and Android installation links. See the previous section for the signed APK workflow.
 
 ## Deployment and operations
 
 1. Build with `npm ci` and `npm run build`; start with `npm start` behind an HTTPS reverse proxy. Use the default secure cookies and set `TRUST_PROXY` only to match your trusted proxy topology. Do not expose the Node port directly to the internet if trusting a proxy.
-2. Run one application instance on a **durable local volume**. Mount `DATA_DIR` on that volume; it contains the SQLite database and uploaded images. Use a restricted service account and keep the volume out of the web root. Do not use an ephemeral filesystem or deploy this version as stateless Vercel functions. A horizontally scaled deployment would require shared storage, a managed relational database, distributed rate limits, and a shared event channel.
-3. The dashboard subscribes to authenticated booking events and polls as a fallback. For immediate updates through a reverse proxy, allow SSE streaming without buffering. HTTPS, the staff account, the catalog and booking hours should be configured before accepting public bookings.
-4. Schedule `npm run backup` daily (configure `BACKUP_DIR`) to take a consistent database snapshot. Back up `DATA_DIR/uploads` separately and store both encrypted off-host with appropriate retention and access controls. Test restoration: stop the instance, restore the snapshot and uploads to a fresh private volume, and restart. Treat records and backups as customer PII, and apply your business's access and retention policies.
+2. For PostgreSQL, set `DATABASE_URL` and `REQUIRE_DATABASE_URL=1` in production (TLS with certificate verification is required in this mode). Use one web instance; administration events and rate limiting are local to the web process, with polling as a fallback. Alternatively, keep `DATABASE_URL` unset and mount `DATA_DIR` on durable local storage for SQLite. Changing engines does not import old SQLite data. Do not use SQLite with an ephemeral filesystem.
+3. Keep encrypted off-host backups of production data. For PostgreSQL, use `pg_dump` or the provider's backup tools (which also cover database-stored uploads). For SQLite, `npm run backup` takes a consistent snapshot; back up any legacy `DATA_DIR/uploads` separately. Restrict access to backups and test restoration before relying on them.
 
 ## Verification
 
@@ -72,3 +72,5 @@ npm run build
 ```
 
 The integration tests start a separate instance with a temporary database and a simulated Razorpay API. They verify role separation, publishing and pricing, coupon limits, schedule blocks, conflicting reservations, booking idempotency, status tracking, CSV export, and signature/capture handling. Live Razorpay and SMS still require provider configuration and an external integration test.
+
+To run the same integration tests against PostgreSQL, set `TEST_DATABASE_URL` to a **disposable, empty** database before running `npm test`. Never point the test suite at production.

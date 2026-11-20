@@ -38,7 +38,7 @@ async function razor(path, options = {}) {
 }
 const orderJobs = new Map();
 export async function order(id) {
-  const b = booking(id);
+  const b = await booking(id);
   if (b.status !== "awaiting_payment") return null;
   if (b.order_id) return checkout(id, b.order_id, b.total);
   if (!orderJobs.has(id)) {
@@ -52,14 +52,15 @@ export async function order(id) {
           notes: { booking_id: id },
         }),
       });
-      run(
+      await run(
         "UPDATE payments SET order_id=? WHERE booking_id=? AND order_id IS NULL",
         orderId,
         id,
       );
       return checkout(
         id,
-        one("SELECT order_id FROM payments WHERE booking_id=?", id).order_id,
+        (await one("SELECT order_id FROM payments WHERE booking_id=?", id))
+          .order_id,
         b.total,
       );
     })().finally(() => orderJobs.delete(id));
@@ -76,9 +77,9 @@ function checkout(bookingId, orderId, amount) {
     key: process.env.RAZORPAY_KEY_ID,
   };
 }
-export function recordPayment(entity) {
-  const id = tx(() => {
-    const b = one(
+export async function recordPayment(entity) {
+  const id = await tx(async () => {
+    const b = await one(
       "SELECT b.*,p.state,p.order_id,p.payment_id,p.amount FROM bookings b JOIN payments p ON p.booking_id=b.id WHERE p.order_id=?",
       entity.order_id,
     );
@@ -93,20 +94,20 @@ export function recordPayment(entity) {
     if (entity.status === "captured") {
       const active =
         b.status === "awaiting_payment" && b.hold_until > Date.now();
-      run(
+      await run(
         "UPDATE payments SET state=?, payment_id=?,updated=? WHERE booking_id=?",
         active ? "paid" : "paid_review",
         entity.id,
         Date.now(),
         b.id,
       );
-      run(
+      await run(
         "UPDATE bookings SET status=?,hold_until=NULL WHERE id=?",
         active ? "confirmed" : "payment_review",
         b.id,
       );
     } else if (entity.status === "failed" && b.status === "awaiting_payment") {
-      run(
+      await run(
         "UPDATE payments SET state='failed',updated=? WHERE booking_id=?",
         Date.now(),
         b.id,
@@ -136,21 +137,28 @@ export async function verify(b, { orderId, paymentId, signature }) {
     entity.currency !== "INR"
   )
     fail(400, "Payment details do not match.");
-  recordPayment(entity);
-  return booking(b.id);
+  await recordPayment(entity);
+  return await booking(b.id);
 }
-export async function notify(id) {
+export function notify(id) {
+  void sendNotification(id).catch((error) => {
+    console.error("Booking SMS could not be sent:", error.code || error.name);
+  });
+}
+async function sendNotification(id) {
   const sid = process.env.TWILIO_ACCOUNT_SID,
     token = process.env.TWILIO_AUTH_TOKEN,
     from = process.env.TWILIO_FROM;
   if (!sid || !token || !from) return;
-  const b = booking(id);
+  const b = await booking(id);
   if (!b || !["confirmed", "pending"].includes(b.status)) return;
   if (
-    !run(
-      "INSERT OR IGNORE INTO notification_deliveries(booking_id,kind) VALUES(?,?)",
-      id,
-      b.status,
+    !(
+      await run(
+        "INSERT INTO notification_deliveries(booking_id,kind) VALUES(?,?) ON CONFLICT DO NOTHING",
+        id,
+        b.status,
+      )
     ).changes
   )
     return;
@@ -172,14 +180,14 @@ export async function notify(id) {
       },
     );
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    run(
+    await run(
       "UPDATE notification_deliveries SET sent=? WHERE booking_id=? AND kind=?",
       Date.now(),
       id,
       b.status,
     );
   } catch (e) {
-    run(
+    await run(
       "DELETE FROM notification_deliveries WHERE booking_id=? AND kind=? AND sent=0",
       id,
       b.status,
